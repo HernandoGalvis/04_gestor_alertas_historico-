@@ -1,29 +1,51 @@
+"""
+VERSIÓN: 1.0.0
+TÍTULO: Generador Multiproceso de Alertas de Indicadores Financieros con is_closed
+DESCRIPCIÓN:
+    - Este script genera alertas históricas basadas en indicadores técnicos, procesando snapshots cada 5 minutos
+      para múltiples tickers y temporalidades.
+    - Usa multiprocessing para paralelizar el cálculo por ticker, optimizando el uso de recursos en servidores multinúcleo.
+    - Divide el procesamiento en paquetes por ticker y día, minimizando uso de memoria y permitiendo commits frecuentes.
+    - El campo is_closed indica si el snapshot corresponde al cierre real de la vela.
+    - El campo is_closed es propagado a la tabla de alertas_generadas.
+"""
+
 import logging
 import pandas as pd
 from datetime import datetime
 from config import RANGO_FECHAS
 from db_connect import fetch_dataframe, fetchall_dict, execute_many
 from utils import native
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
+# ==== CONFIGURACIÓN DE LOGGING ====
 logging.basicConfig(level=logging.INFO)
 
+# ==== FUNCIONES DE CARGA DESDE BASE DE DATOS ====
 def obtener_tickers_activos():
+    """Obtiene la lista de tickers activos desde la base de datos."""
     rows = fetchall_dict("SELECT ticker FROM tickers WHERE activo IS TRUE")
     return [row["ticker"] for row in rows]
 
 def cargar_criterios():
+    """Carga los criterios activos desde la base de datos."""
     criterios = fetchall_dict(
         "SELECT id_criterio, nombre_criterio, tipo_criterio, parametros_relevantes, puntos_maximos_base, direccion, activo, temporalidades_implicadas FROM catalogo_criterios WHERE activo = TRUE"
     )
     return criterios
 
 def cargar_rangos_por_criterio(criterio_id):
+    """Carga los rangos de ponderación asociados a un criterio específico."""
     rangos = fetchall_dict(
         "SELECT * FROM criterio_rangos_ponderacion WHERE id_criterio_fk = %s", (criterio_id,)
     )
     return rangos
 
 def cargar_indicadores(ticker, fecha_ini, fecha_fin):
+    """
+    Carga todos los snapshots de indicadores para un ticker y rango de fechas.
+    Incluye tanto abiertos como cerrados (is_closed).
+    """
     query = """
         SELECT *
         FROM indicadores
@@ -32,7 +54,9 @@ def cargar_indicadores(ticker, fecha_ini, fecha_fin):
     """
     return fetch_dataframe(query, params=(ticker, fecha_ini, fecha_fin))
 
+# ==== FUNCIONES AUXILIARES ====
 def extraer_ymd(timestamp):
+    """Extrae año, mes y día de un timestamp."""
     if isinstance(timestamp, pd.Timestamp):
         ts = timestamp
     else:
@@ -40,15 +64,20 @@ def extraer_ymd(timestamp):
     return ts.year, ts.month, ts.day
 
 def formatear_resultado_criterio(nombre_rango, tipo_impacto, puntaje):
+    """Devuelve cadena legible resumen del resultado del criterio."""
     return f"{nombre_rango} | {tipo_impacto} | puntos={puntaje:.2f}"
 
+# ==== FUNCIONES DE EVALUACIÓN DE CRITERIOS ====
 def evaluar_indicador_vs_constante(fila, criterio, rangos):
+    """
+    Evalúa si el valor de un indicador cae dentro de los rangos definidos,
+    generando una alerta si corresponde.
+    """
     campo = criterio["parametros_relevantes"].strip()
     valor = fila.get(campo)
     if valor is None:
         return None
     resultado = valor
-
     for rango in rangos:
         lim_inf = float(rango.get("limite_inferior"))
         lim_sup = float(rango.get("limite_superior"))
@@ -56,6 +85,7 @@ def evaluar_indicador_vs_constante(fila, criterio, rangos):
         incluye_inf = rango.get("incluye_limite_inferior", True)
         incluye_sup = rango.get("incluye_limite_superior", True)
         match = False
+        # Lógica para operador BETWEEN
         if operador == "BETWEEN":
             if incluye_inf and incluye_sup:
                 match = lim_inf <= resultado <= lim_sup
@@ -80,6 +110,8 @@ def evaluar_indicador_vs_constante(fila, criterio, rangos):
                 puntos_neutral = 0.0
                 puntaje = 0.0
             yyyy, mm, dd = extraer_ymd(fila["timestamp"])
+            is_closed = fila.get("is_closed", None)
+            # Retorna tupla lista para execute_many, propagando is_closed
             alerta = (
                 str(criterio["id_criterio"]),
                 str(fila["ticker"]),
@@ -90,22 +122,25 @@ def evaluar_indicador_vs_constante(fila, criterio, rangos):
                 formatear_resultado_criterio(rango["nombre_rango"], tipo_impacto, puntaje),
                 rango["id_rango"],
                 float(puntos_long), float(puntos_short), float(puntos_neutral),
-                int(yyyy), int(mm), int(dd)
+                int(yyyy), int(mm), int(dd),
+                is_closed
             )
             return alerta
     return None
 
 def evaluar_indicador_vs_indicador(fila, criterio, rangos):
+    """
+    Evalúa la relación entre dos indicadores, comparando el ratio con los rangos definidos.
+    """
     params = [x.strip() for x in criterio["parametros_relevantes"].split(";")]
     if len(params) != 2:
-        return None  # Mal definida la parametrización
+        return None
     campo1, campo2 = params
     valor1 = fila.get(campo1)
     valor2 = fila.get(campo2)
     if valor1 is None or valor2 is None or valor2 == 0:
         return None
-    resultado = (valor1 / valor2) * 100  # Ratio como porcentaje
-
+    resultado = (valor1 / valor2) * 100
     for rango in rangos:
         lim_inf = float(rango.get("limite_inferior"))
         lim_sup = float(rango.get("limite_superior"))
@@ -137,6 +172,7 @@ def evaluar_indicador_vs_indicador(fila, criterio, rangos):
                 puntos_neutral = 0.0
                 puntaje = 0.0
             yyyy, mm, dd = extraer_ymd(fila["timestamp"])
+            is_closed = fila.get("is_closed", None)
             alerta = (
                 str(criterio["id_criterio"]),
                 str(fila["ticker"]),
@@ -147,14 +183,19 @@ def evaluar_indicador_vs_indicador(fila, criterio, rangos):
                 formatear_resultado_criterio(rango["nombre_rango"], tipo_impacto, puntaje),
                 rango["id_rango"],
                 float(puntos_long), float(puntos_short), float(puntos_neutral),
-                int(yyyy), int(mm), int(dd)
+                int(yyyy), int(mm), int(dd),
+                is_closed
             )
             return alerta
     return None
 
 def evaluar_orden_indicadores(fila, criterio, rangos):
+    """
+    Evalúa si varios indicadores cumplen un orden definido (ej: EMA10 > EMA20 > EMA50),
+    útil para tendencias.
+    """
     campos = [x.strip() for x in criterio["parametros_relevantes"].split(";")]
-    direccion = criterio.get("direccion", "desc").lower()  # "desc" para alcista/LONG, "asc" para bajista/SHORT
+    direccion = criterio.get("direccion", "desc").lower()
     valores = [fila.get(campo) for campo in campos]
     if any(v is None for v in valores):
         return None
@@ -163,7 +204,7 @@ def evaluar_orden_indicadores(fila, criterio, rangos):
         if direccion == "desc":
             if valores[i] > valores[i+1]:
                 count_ok += 1
-        else:  # "asc"
+        else:
             if valores[i] < valores[i+1]:
                 count_ok += 1
     rango_asignado = None
@@ -189,7 +230,6 @@ def evaluar_orden_indicadores(fila, criterio, rangos):
             break
     if not rango_asignado:
         return None
-
     porcentaje = float(rango_asignado["porcentaje_puntos_base"])
     puntos_maximos = float(criterio["puntos_maximos_base"]) if criterio.get("puntos_maximos_base") else 10.0
     tipo_impacto = (rango_asignado.get("tipo_impacto") or "").upper()
@@ -205,6 +245,7 @@ def evaluar_orden_indicadores(fila, criterio, rangos):
 
     yyyy, mm, dd = extraer_ymd(fila["timestamp"])
     valor_detalle_1 = ";".join(f"{campo}:{fila.get(campo):.4f}" for campo in campos)
+    is_closed = fila.get("is_closed", None)
     alerta = (
         str(criterio["id_criterio"]),
         str(fila["ticker"]),
@@ -215,11 +256,16 @@ def evaluar_orden_indicadores(fila, criterio, rangos):
         formatear_resultado_criterio(rango_asignado["nombre_rango"], tipo_impacto, puntaje),
         rango_asignado["id_rango"],
         float(puntos_long), float(puntos_short), float(puntos_neutral),
-        int(yyyy), int(mm), int(dd)
+        int(yyyy), int(mm), int(dd),
+        is_closed
     )
     return alerta
 
 def evaluar_umbral_dinamico(fila, criterio, rangos):
+    """
+    Evalúa umbrales calculados dinámicamente (por fórmula) y los compara,
+    útil para condiciones adaptativas.
+    """
     try:
         params = [x.strip() for x in criterio["parametros_relevantes"].split(";")]
         if len(params) != 2:
@@ -265,6 +311,7 @@ def evaluar_umbral_dinamico(fila, criterio, rangos):
                 puntos_neutral = 0.0
                 puntaje = 0.0
             yyyy, mm, dd = extraer_ymd(fila["timestamp"])
+            is_closed = fila.get("is_closed", None)
             valor_detalle_1 = f"{indicador_objetivo}:{valor_objetivo:.4f}; umbral:{umbral:.4f}"
             alerta = (
                 str(criterio["id_criterio"]),
@@ -276,143 +323,48 @@ def evaluar_umbral_dinamico(fila, criterio, rangos):
                 formatear_resultado_criterio(rango["nombre_rango"], tipo_impacto, puntaje),
                 rango["id_rango"],
                 float(puntos_long), float(puntos_short), float(puntos_neutral),
-                int(yyyy), int(mm), int(dd)
+                int(yyyy), int(mm), int(dd),
+                is_closed
             )
             return alerta
     return None
 
-def evaluar_rsi_multi_timeframe(fila, criterio, rangos, df_multi):
-    campo = criterio["parametros_relevantes"].strip()
-    tfs = [tf.strip() for tf in criterio["temporalidades_implicadas"].split(";") if tf.strip()]
-    timestamp = fila["timestamp"]
-    ticker = fila["ticker"]
+# ==== FUNCIÓN PRINCIPAL DE PROCESAMIENTO POR TICKER ====
+def procesar_ticker(ticker, criterios_simples, fecha_inicio, fecha_fin):
+    """
+    Procesa todos los snapshots de un ticker en el rango dado.
+    Divide en paquetes por día (para bajo uso de memoria y commits frecuentes).
+    Devuelve ticker y total de alertas generadas.
+    """
+    from db_connect import fetch_dataframe, fetchall_dict, execute_many  # Import dentro del proceso
+    logging.info(f">>> INICIO procesamiento ticker: {ticker} <<<")
+    df = cargar_indicadores(ticker, fecha_inicio, fecha_fin)
+    if df.empty:
+        logging.warning(f"No hay datos para {ticker}")
+        return ticker, 0
+    df["ticker"] = ticker
 
-    id_criterio = str(criterio.get("id_criterio", "")).lower()
-    es_long = "long" in id_criterio
-    es_short = "short" in id_criterio
+    # Agrupa el DataFrame por día calendario
+    df['fecha'] = pd.to_datetime(df['timestamp']).dt.date
+    fechas = df['fecha'].unique()
+    fechas = sorted(fechas)
+    total_alertas = 0
 
-    if not rangos:
-        return None
-    primer_rango = rangos[0]
-    operador = (primer_rango.get("operador") or "<=").strip()
-    if es_long:
-        umbral = min(float(r.get("limite_superior", 35)) for r in rangos)
-    elif es_short:
-        umbral = max(float(r.get("limite_inferior", 70)) for r in rangos)
-    else:
-        umbral = float(primer_rango.get("limite_superior", 35))
-
-    cumple = 0
-    valores = []
-    for tf in tfs:
-        df_tf = df_multi.get(tf)
-        valor = None
-        if df_tf is not None and not df_tf.empty:
-            sub = df_tf[df_tf["timestamp"] <= timestamp]
-            if not sub.empty:
-                fila_tf = sub.iloc[-1]
-                valor = fila_tf.get(campo)
-        valores.append((tf, valor))
-        if valor is None:
+    # CICLO PRINCIPAL: por día
+    for fecha in fechas:
+        df_dia = df[df['fecha'] == fecha]
+        if df_dia.empty:
             continue
-        if operador == "<=" and valor <= umbral:
-            cumple += 1
-        elif operador == "<" and valor < umbral:
-            cumple += 1
-        elif operador == ">=" and valor >= umbral:
-            cumple += 1
-        elif operador == ">" and valor > umbral:
-            cumple += 1
-
-    rango_asignado = None
-    for rango in rangos:
-        rango_operador = (rango.get("operador") or "BETWEEN").upper()
-        lim_inf = int(rango.get("limite_inferior", 0))
-        lim_sup = int(rango.get("limite_superior", 0))
-        incluye_inf = rango.get("incluye_limite_inferior", True)
-        incluye_sup = rango.get("incluye_limite_superior", True)
-        valor_eval = cumple
-        match = False
-        if rango_operador == "BETWEEN":
-            if incluye_inf and incluye_sup:
-                match = lim_inf <= valor_eval <= lim_sup
-            elif incluye_inf and not incluye_sup:
-                match = lim_inf <= valor_eval < lim_sup
-            elif not incluye_inf and incluye_sup:
-                match = lim_inf < valor_eval <= lim_sup
-            else:
-                match = lim_inf < valor_eval < lim_sup
-        elif rango_operador == "==":
-            match = valor_eval == lim_inf
-        elif rango_operador == ">=":
-            match = valor_eval >= lim_inf
-        elif rango_operador == "<=":
-            match = valor_eval <= lim_sup
-        if match:
-            rango_asignado = rango
-            break
-    if not rango_asignado:
-        return None
-
-    porcentaje = float(rango_asignado.get("porcentaje_puntos_base", 100))
-    puntos_maximos = float(criterio.get("puntos_maximos_base") or 10.0)
-    tipo_impacto = (rango_asignado.get("tipo_impacto") or "").upper()
-    puntos_long = puntos_short = puntos_neutral = 0.0
-    puntaje = puntos_maximos * porcentaje / 100
-    if tipo_impacto == "LONG":
-        puntos_long = puntaje
-    elif tipo_impacto == "SHORT":
-        puntos_short = puntaje
-    elif tipo_impacto == "NEUTRAL":
-        puntos_neutral = puntaje
-
-    yyyy, mm, dd = extraer_ymd(fila["timestamp"])
-    valor_detalle_1 = "rsi_14 - " + ", ".join(
-        f"{tf}={v:.2f}" if v is not None else f"{tf}=None"
-        for tf, v in valores
-    )
-    timeframe_mayor = tfs[0] if tfs else str(fila["timeframe"])
-    alerta = (
-        str(criterio["id_criterio"]),
-        str(fila["ticker"]),
-        timeframe_mayor,
-        str(fila["timestamp"]),
-        valor_detalle_1,
-        '', '',
-        formatear_resultado_criterio(rango_asignado["nombre_rango"], tipo_impacto, puntaje),
-        rango_asignado["id_rango"],
-        float(puntos_long), float(puntos_short), float(puntos_neutral),
-        int(yyyy), int(mm), int(dd)
-    )
-    return alerta
-
-def main():
-    logging.info(f"==== INICIO SCRIPT ALERTAS INDICADORES ====")
-    criterios = cargar_criterios()
-    criterios_simples = [c for c in criterios if c.get("tipo_criterio") != "multi_timeframe"]
-    criterios_multi = [c for c in criterios if c.get("tipo_criterio") == "multi_timeframe"]
-
-    logging.info(f"Criterios simples encontrados: {len(criterios_simples)}")
-    logging.info(f"Criterios multi_timeframe encontrados: {len(criterios_multi)}")
-
-    tickers = obtener_tickers_activos()
-    logging.info(f"Tickers activos: {tickers}")
-
-    for ticker in tickers:
-        df = cargar_indicadores(ticker, RANGO_FECHAS["inicio"], RANGO_FECHAS["fin"])
-        if df.empty:
-            logging.warning(f"No hay datos para {ticker}")
-            continue
-        df["ticker"] = ticker
-
-        # --- Ciclo para criterios simples ---
         alertas = []
+        logging.info(f"--- INICIO paquete: ticker={ticker}, fecha={fecha}, registros={len(df_dia)} ---")
+        # CICLO por criterio
         for criterio in criterios_simples:
             tipo = criterio.get("tipo_criterio")
             rangos = cargar_rangos_por_criterio(criterio["id_criterio"])
             if not rangos:
                 continue
-            for idx, fila in df.iterrows():
+            # CICLO por snapshot (registro de indicadores)
+            for idx, fila in df_dia.iterrows():
                 if tipo == "indicador_vs_constante":
                     alerta = evaluar_indicador_vs_constante(fila, criterio, rangos)
                 elif tipo == "indicador_vs_indicador":
@@ -425,58 +377,52 @@ def main():
                     alerta = None
                 if alerta:
                     alertas.append(alerta)
+        # Commit de alertas del paquete diario
         if alertas:
             execute_many("""
                 INSERT INTO alertas_generadas
-                (id_criterio_fk, ticker, timeframe, timestamp_alerta, valor_detalle_1, valor_detalle_2, valor_detalle_3, resultado_criterio, id_rango_fk, puntos_long, puntos_short, puntos_neutral, yyyy, mm, dd)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (id_criterio_fk, ticker, timeframe, timestamp_alerta, valor_detalle_1, valor_detalle_2, valor_detalle_3, resultado_criterio, id_rango_fk, puntos_long, puntos_short, puntos_neutral, yyyy, mm, dd, is_closed)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT DO NOTHING
             """, alertas)
-            logging.info(f"{ticker}: {len(alertas)} alertas registradas (simples).")
-        else:
-            logging.info(f"{ticker}: No se generaron alertas simples.")
+        logging.info(f"--- FIN paquete: ticker={ticker}, fecha={fecha}, alertas generadas={len(alertas)} ---")
+        total_alertas += len(alertas)
+    logging.info(f">>> FIN procesamiento ticker: {ticker} | Total alertas generadas: {total_alertas} <<<")
+    return ticker, total_alertas
 
-        # --- Ciclo especial para criterios multi_timeframe ---
-        if criterios_multi:
-            logging.info(f"{ticker}: Procesando criterios multi_timeframe...")
-            tfs_usados = set()
-            for criterio in criterios_multi:
-                tfs = [tf.strip() for tf in str(criterio.get("temporalidades_implicadas", "")).split(";") if tf.strip()]
-                tfs_usados.update(tfs)
-            df_multi = {}
-            for tf in tfs_usados:
-                df_multi[tf] = df[df["timeframe"] == tf]
+# ==== FUNCIÓN PRINCIPAL (MULTIPROCESO) ====
+def main():
+    """
+    Orquesta la ejecución paralela por tickers usando ProcessPoolExecutor.
+    """
+    logging.info(f"==== INICIO SCRIPT ALERTAS INDICADORES (Multiprocessing) ====")
+    criterios = cargar_criterios()
+    criterios_simples = [c for c in criterios if c.get("tipo_criterio") != "multi_timeframe"]
+    logging.info(f"Criterios simples encontrados: {len(criterios_simples)}")
+    tickers = obtener_tickers_activos()
+    logging.info(f"Tickers activos: {tickers}")
 
-            for criterio in criterios_multi:
-                logging.info(f"{ticker}: Procesando criterio multi_timeframe: {criterio['nombre_criterio']} ({criterio['id_criterio']})")
-                rangos = cargar_rangos_por_criterio(criterio["id_criterio"])
-                tfs = [tf.strip() for tf in str(criterio.get("temporalidades_implicadas", "")).split(";") if tf.strip()]
-                if not tfs or not rangos:
-                    continue
-                tf_mayor = tfs[0]
-                df_mayor = df_multi.get(tf_mayor)
-                if df_mayor is None or df_mayor.empty:
-                    logging.warning(f"{ticker}: No hay datos para TF mayor {tf_mayor} en criterio {criterio['nombre_criterio']}")
-                    continue
-                alertas_mt = []
-                for idx, fila in df_mayor.iterrows():
-                    alerta = evaluar_rsi_multi_timeframe(fila, criterio, rangos, df_multi)
-                    if alerta:
-                        alertas_mt.append(alerta)
-                if alertas_mt:
-                    execute_many("""
-                        INSERT INTO alertas_generadas
-                        (id_criterio_fk, ticker, timeframe, timestamp_alerta, valor_detalle_1, valor_detalle_2, valor_detalle_3, resultado_criterio, id_rango_fk, puntos_long, puntos_short, puntos_neutral, yyyy, mm, dd)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT DO NOTHING
-                    """, alertas_mt)
-                    logging.info(f"{ticker}: {len(alertas_mt)} alertas multi_timeframe registradas para criterio {criterio['nombre_criterio']}.")
-                else:
-                    logging.info(f"{ticker}: No se generaron alertas multi_timeframe para criterio {criterio['nombre_criterio']}.")
-        else:
-            logging.info("No existen criterios multi_timeframe definidos en el sistema.")
+    fecha_inicio = RANGO_FECHAS["inicio"]
+    fecha_fin = RANGO_FECHAS["fin"]
+
+    max_procesos = 3  # Ajusta según la capacidad de tu máquina
+
+    # Procesamiento paralelo por tickers
+    with ProcessPoolExecutor(max_workers=max_procesos) as executor:
+        futures = []
+        for ticker in tickers:
+            futures.append(executor.submit(procesar_ticker, ticker, criterios_simples, fecha_inicio, fecha_fin))
+        for future in as_completed(futures):
+            ticker, total_alertas = future.result()
+            logging.info(f"Resumen Ticker {ticker}: alertas totales generadas = {total_alertas}")
 
     logging.info(f"==== FIN SCRIPT ALERTAS INDICADORES ====")
 
+# ==== EJECUCIÓN PRINCIPAL ====
 if __name__ == "__main__":
     main()
+
+"""
+VERSIÓN: 1.0.0
+FIN DEL SCRIPT Generador Multiproceso de Alertas de Indicadores Financieros con is_closed
+"""
