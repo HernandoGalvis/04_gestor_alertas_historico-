@@ -1,5 +1,5 @@
 """
-VERSIÓN: 1.0.0
+VERSIÓN: 1.3.0
 TÍTULO: Generador Multiproceso de Alertas de Indicadores Financieros con is_closed
 DESCRIPCIÓN:
     - Este script genera alertas históricas basadas en indicadores técnicos, procesando snapshots cada 5 minutos
@@ -423,6 +423,6 @@ if __name__ == "__main__":
     main()
 
 """
-VERSIÓN: 1.0.0
+VERSIÓN: 1.3.0
 FIN DEL SCRIPT Generador Multiproceso de Alertas de Indicadores Financieros con is_closed
 """
